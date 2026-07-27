@@ -4,7 +4,8 @@
 Each line of PDF text becomes a real, editable HWPX paragraph/run: font
 size, bold, italic and colour are carried over from the PDF, and the
 line's original position is approximated with a left indent (horizontal)
-and space-before (vertical) computed from the PDF coordinates. Images are
+and space-before (vertical) computed from the PDF coordinates. Detected
+tables become real HWPX tables (<hp:tbl>), not loose text. Images are
 re-embedded as floating pictures anchored to their original page position.
 
 This is a best-effort layout reconstruction, not a pixel-perfect one:
@@ -44,6 +45,13 @@ PT_TO_HWPUNIT = 100  # HWPUNIT = 1/7200 inch; 1pt = 7200/72 = 100 HWPUNIT
 FONT_ITALIC_FLAG = 1 << 1
 FONT_BOLD_FLAG = 1 << 4
 
+# A table nested inside another detected table's cell is reported as its
+# own separate table by find_tables(); if it overlaps an already-kept
+# table by more than this fraction of its own area, treat it as a
+# duplicate/nested detection and drop it rather than rendering the same
+# content twice.
+NESTED_TABLE_OVERLAP_THRESHOLD = 0.8
+
 
 def pt_to_hwpunit(value: float) -> int:
     return round(value * PT_TO_HWPUNIT)
@@ -67,11 +75,65 @@ def span_color(span: dict) -> str:
     return f"#{value & 0xFFFFFF:06X}"
 
 
-def extract_page_lines(page: "fitz.Page") -> list[dict]:
+def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
+    x0, y0, x1, y1 = bbox
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def _bbox_overlap_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    return max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+
+
+def extract_page_tables(page: "fitz.Page") -> list:
+    """Return detected tables for *page*, with nested/duplicate detections dropped.
+
+    ``page.find_tables()`` sometimes reports a table *and* the smaller
+    tables nested inside its cells as separate results. Keeping both would
+    render the same content twice, so only the largest (outermost) table
+    in each overlapping cluster is kept; anything nested inside it stays
+    as flattened text within that outer table's cell.
+    """
+    try:
+        found = list(page.find_tables().tables)
+    except Exception:
+        return []
+
+    def has_text(t) -> bool:
+        try:
+            grid = t.extract()
+        except Exception:
+            return False
+        return any((cell or "").strip() for row in grid for cell in row)
+
+    found = [
+        t for t in found
+        if t.row_count > 0 and t.col_count > 0 and _bbox_area(t.bbox) > 0 and has_text(t)
+    ]
+    found.sort(key=lambda t: _bbox_area(t.bbox), reverse=True)
+
+    kept = []
+    for table in found:
+        area = _bbox_area(table.bbox)
+        if any(_bbox_overlap_area(table.bbox, k.bbox) / area > NESTED_TABLE_OVERLAP_THRESHOLD for k in kept):
+            continue
+        kept.append(table)
+
+    kept.sort(key=lambda t: (round(t.bbox[1], 1), t.bbox[0]))
+    return kept
+
+
+def extract_page_lines(page: "fitz.Page", exclude_bboxes: list[tuple[float, float, float, float]] = ()) -> list[dict]:
     """Return text lines on *page*, sorted into a top-to-bottom reading order.
 
-    Multi-column pages are not reflowed into columns; lines are simply
-    ordered by vertical position, then horizontal position.
+    Lines whose centre falls inside one of *exclude_bboxes* (detected
+    tables, handled separately) are skipped so table text is not
+    duplicated as loose paragraphs. Multi-column pages are not reflowed
+    into columns; lines are simply ordered by vertical position, then
+    horizontal position.
     """
     raw = page.get_text("dict")
     lines = []
@@ -81,6 +143,10 @@ def extract_page_lines(page: "fitz.Page") -> list[dict]:
         for line in block.get("lines", []):
             spans = [s for s in line.get("spans", []) if s.get("text", "").strip()]
             if not spans:
+                continue
+            x0, y0, x1, y1 = line["bbox"]
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            if any(bx0 <= cx <= bx1 and by0 <= cy <= by1 for bx0, by0, bx1, by1 in exclude_bboxes):
                 continue
             lines.append({"bbox": line["bbox"], "spans": spans})
     lines.sort(key=lambda ln: (round(ln["bbox"][1], 1), ln["bbox"][0]))
@@ -116,6 +182,43 @@ def extract_page_images(page: "fitz.Page", dpi: int) -> list[dict]:
             continue
         images.append({"bbox": bbox, "png": png_bytes})
     return images
+
+
+def add_table_block(doc: "HwpxDocument", table) -> "object":
+    """Insert *table* (a fitz.table.Table) as a real HWPX table and return it."""
+    x0, y0, x1, y1 = table.bbox
+    hwpx_table = doc.add_table(
+        table.row_count,
+        table.col_count,
+        width=pt_to_hwpunit(x1 - x0),
+        height=pt_to_hwpunit(y1 - y0),
+    )
+
+    first_row_cells = table.rows[0].cells if table.rows else None
+    if first_row_cells and len(first_row_cells) == table.col_count and all(c is not None for c in first_row_cells):
+        weights = [max(c[2] - c[0], 1.0) for c in first_row_cells]
+        try:
+            hwpx_table.set_column_widths(weights)
+        except Exception:
+            pass
+
+    try:
+        grid = table.extract()
+    except Exception:
+        grid = []
+
+    for row_index in range(table.row_count):
+        row_data = grid[row_index] if row_index < len(grid) else []
+        for col_index in range(table.col_count):
+            cell_text = row_data[col_index] if col_index < len(row_data) else None
+            if not cell_text:
+                continue
+            try:
+                hwpx_table.set_cell_text(row_index, col_index, cell_text, split_paragraphs=True)
+            except Exception:
+                pass
+
+    return hwpx_table
 
 
 def build_hwpx(pdf_path: str, output_path: str, *, dpi: int = 150, max_pages: int | None = None) -> None:
@@ -157,41 +260,50 @@ def build_hwpx(pdf_path: str, output_path: str, *, dpi: int = 150, max_pages: in
                     )
                     warned_size_mismatch = True
 
-                lines = extract_page_lines(page)
+                tables = extract_page_tables(page)
+                table_bboxes = [t.bbox for t in tables]
+                lines = extract_page_lines(page, exclude_bboxes=table_bboxes)
                 images = extract_page_images(page, dpi)
+
+                blocks = [{"kind": "line", "bbox": ln["bbox"], "line": ln} for ln in lines]
+                blocks += [{"kind": "table", "bbox": t.bbox, "table": t} for t in tables]
+                blocks.sort(key=lambda b: (round(b["bbox"][1], 1), b["bbox"][0]))
 
                 page_anchor_paragraph = None
                 prev_bottom_pt = 0.0
-                is_first_paragraph_on_page = True
+                is_first_block_on_page = True
 
-                for line in lines:
-                    x0, y0, x1, y1 = line["bbox"]
+                for block in blocks:
+                    x0, y0, x1, y1 = block["bbox"]
                     gap_pt = max(0.0, y0 - prev_bottom_pt)
                     prev_bottom_pt = y1
 
-                    if page_index == 0 and is_first_paragraph_on_page:
-                        paragraph = first_paragraph
+                    if block["kind"] == "line":
+                        if page_index == 0 and is_first_block_on_page:
+                            paragraph = first_paragraph
+                        else:
+                            paragraph = doc.add_paragraph("", include_run=False)
+
+                        for span in block["line"]["spans"]:
+                            text = span.get("text", "")
+                            if not text:
+                                continue
+                            paragraph.add_run(
+                                text,
+                                bold=span_is_bold(span),
+                                italic=span_is_italic(span),
+                                color=span_color(span),
+                                size=round(span.get("size", 10.0), 1),
+                            )
                     else:
-                        paragraph = doc.add_paragraph("", include_run=False)
+                        hwpx_table = add_table_block(doc, block["table"])
+                        paragraph = hwpx_table.paragraph
 
-                    if page_index > 0 and is_first_paragraph_on_page:
+                    if page_index > 0 and is_first_block_on_page:
                         paragraph.element.set("pageBreak", "1")
-
-                    is_first_paragraph_on_page = False
+                    is_first_block_on_page = False
                     if page_anchor_paragraph is None:
                         page_anchor_paragraph = paragraph
-
-                    for span in line["spans"]:
-                        text = span.get("text", "")
-                        if not text:
-                            continue
-                        paragraph.add_run(
-                            text,
-                            bold=span_is_bold(span),
-                            italic=span_is_italic(span),
-                            color=span_color(span),
-                            size=round(span.get("size", 10.0), 1),
-                        )
 
                     para_index = doc.paragraphs.index(paragraph)
                     doc.set_paragraph_format(
@@ -205,30 +317,30 @@ def build_hwpx(pdf_path: str, output_path: str, *, dpi: int = 150, max_pages: in
                 if images:
                     if page_anchor_paragraph is None:
                         page_anchor_paragraph = doc.add_paragraph("", include_run=False)
-                        if page_index > 0 and is_first_paragraph_on_page:
+                        if page_index > 0 and is_first_block_on_page:
                             page_anchor_paragraph.element.set("pageBreak", "1")
-                        is_first_paragraph_on_page = False
+                        is_first_block_on_page = False
 
                     for image in images:
-                        x0, y0, x1, y1 = image["bbox"]
+                        ix0, iy0, ix1, iy1 = image["bbox"]
                         item_id = doc.add_image(image["png"], "png")
                         page_anchor_paragraph.add_picture(
                             item_id,
-                            width=pt_to_hwpunit(x1 - x0),
-                            height=pt_to_hwpunit(y1 - y0),
+                            width=pt_to_hwpunit(ix1 - ix0),
+                            height=pt_to_hwpunit(iy1 - iy0),
                             treat_as_char=False,
                             pos_overrides={
                                 "horzRelTo": "PAPER",
                                 "vertRelTo": "PAPER",
                                 "horzAlign": "LEFT",
                                 "vertAlign": "TOP",
-                                "horzOffset": pt_to_hwpunit(x0),
-                                "vertOffset": pt_to_hwpunit(y0),
+                                "horzOffset": pt_to_hwpunit(ix0),
+                                "vertOffset": pt_to_hwpunit(iy0),
                             },
                         )
 
                 print(f"  {page_index + 1}/{page_count} 페이지 처리 완료 "
-                      f"(텍스트 줄 {len(lines)}개, 이미지 {len(images)}개)")
+                      f"(텍스트 줄 {len(lines)}개, 표 {len(tables)}개, 이미지 {len(images)}개)")
 
             doc.save_to_path(output_path)
     finally:
@@ -263,4 +375,11 @@ if __name__ == "__main__":
 # - 다단(multi-column) 레이아웃은 열을 인식하지 못하고 위→아래 순서로만 배치됩니다.
 # - 회전된 텍스트, 벡터 도형(선/사각형 등)은 변환되지 않습니다. 이미지는 해당 영역을
 #   비트맵으로 다시 렌더링해 원래 위치에 삽입합니다.
+# - 표는 PyMuPDF의 표 감지 기능으로 찾아 실제 HWPX 표(<hp:tbl>)로 재구성합니다. 다만:
+#     * 셀 병합(merge)은 자동으로 복원하지 않습니다 — 병합되어 있던 셀도 각각 별도
+#       셀로 채워집니다.
+#     * 표 안에 중첩된 작은 표가 있으면 바깥쪽 표만 만들고, 안쪽 표는 해당 셀의
+#       텍스트로 평탄화됩니다(중복 삽입 방지를 위한 설계).
+#     * 표 감지 자체가 실패하거나 부정확할 수 있어(특히 테두리선이 없는 표), 그런
+#       경우 표가 아닌 일반 텍스트 줄로 처리됩니다.
 # - 페이지 크기가 페이지마다 다른 PDF는 1페이지 크기로 통일됩니다.
