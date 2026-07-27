@@ -153,6 +153,110 @@ def extract_page_lines(page: "fitz.Page", exclude_bboxes: list[tuple[float, floa
     return lines
 
 
+def _merge_boxes(boxes: list[tuple[float, float, float, float]], gap: float = 2.0) -> list[tuple[float, float, float, float]]:
+    """Union any boxes that touch or overlap (within *gap* points) into one."""
+    pending = [list(b) for b in boxes]
+    changed = True
+    while changed:
+        changed = False
+        merged: list[list[float]] = []
+        while pending:
+            box = pending.pop()
+            i = 0
+            while i < len(pending):
+                other = pending[i]
+                separated = (
+                    box[2] + gap < other[0] or other[2] + gap < box[0]
+                    or box[3] + gap < other[1] or other[3] + gap < box[1]
+                )
+                if not separated:
+                    box = [min(box[0], other[0]), min(box[1], other[1]),
+                           max(box[2], other[2]), max(box[3], other[3])]
+                    pending.pop(i)
+                    changed = True
+                else:
+                    i += 1
+            merged.append(box)
+        pending = merged
+    return [tuple(b) for b in pending]
+
+
+def extract_page_vector_regions(
+    page: "fitz.Page",
+    dpi: int,
+    *,
+    text_bboxes: list[tuple[float, float, float, float]] = (),
+    max_area_fraction: float = 0.35,
+) -> list[dict]:
+    """Rasterise vector-drawn decoration (coloured bars, boxes, gradients, ...).
+
+    PDF viewers render lines/rectangles/gradients as vector paths, which
+    this converter otherwise ignores entirely (only text and raster images
+    are picked up). Nearby paths are merged into bounding regions and each
+    region is re-rendered as a PNG so simple decorations (divider bars,
+    shaded boxes, etc.) survive the conversion.
+
+    Regions that overlap any text line are dropped rather than rasterised,
+    since that text is already being reproduced as real, editable HWPX
+    text elsewhere — baking it into a picture too would duplicate it.
+    Very large regions (more than *max_area_fraction* of the page) are
+    also dropped so an incidental full-page background fill doesn't turn
+    into one giant image covering everything else.
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return []
+
+    page_rect = page.rect
+    boxes = []
+    for d in drawings:
+        rect = d.get("rect")
+        if rect is None or (d.get("fill") is None and d.get("color") is None):
+            continue
+        clipped = fitz.Rect(rect) & page_rect
+        if clipped.is_empty or clipped.width <= 0 or clipped.height <= 0:
+            continue
+        boxes.append((clipped.x0, clipped.y0, clipped.x1, clipped.y1))
+    if not boxes:
+        return []
+
+    page_area = page_rect.width * page_rect.height
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+    regions = []
+    for bbox in _merge_boxes(boxes):
+        x0, y0, x1, y1 = bbox
+        if (x1 - x0) <= 0 or (y1 - y0) <= 0:
+            continue
+        region_area = (x1 - x0) * (y1 - y0)
+        if region_area > page_area * max_area_fraction:
+            continue
+        # Ignore grazing overlaps: a text line's bbox from get_text("dict")
+        # includes generous ascent/descent padding (especially for CJK
+        # fonts) that extends past the visible glyph ink, so shrink it
+        # vertically before comparing — only a real, visually meaningful
+        # overlap (text actually sitting inside the region) should drop it.
+        def _shrunk(tb: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+            tx0, ty0, tx1, ty1 = tb
+            inset = min(3.0, (ty1 - ty0) * 0.25)
+            return (tx0, ty0 + inset, tx1, ty1 - inset)
+
+        if any(
+            _bbox_overlap_area(bbox, shrunk) > 0.02 * min(region_area, _bbox_area(shrunk))
+            for tb in text_bboxes
+            if _bbox_area(shrunk := _shrunk(tb)) > 0
+        ):
+            continue
+        try:
+            pix = page.get_pixmap(matrix=matrix, clip=fitz.Rect(bbox), alpha=True)
+            png_bytes = pix.tobytes("png")
+        except Exception:
+            continue
+        regions.append({"bbox": bbox, "png": png_bytes, "behind_text": True})
+    return regions
+
+
 def extract_page_images(page: "fitz.Page", dpi: int) -> list[dict]:
     """Render each placed image's own page region as a standalone PNG.
 
@@ -263,7 +367,9 @@ def build_hwpx(pdf_path: str, output_path: str, *, dpi: int = 150, max_pages: in
                 tables = extract_page_tables(page)
                 table_bboxes = [t.bbox for t in tables]
                 lines = extract_page_lines(page, exclude_bboxes=table_bboxes)
+                all_line_bboxes = [ln["bbox"] for ln in extract_page_lines(page)]
                 images = extract_page_images(page, dpi)
+                images += extract_page_vector_regions(page, dpi, text_bboxes=all_line_bboxes)
 
                 blocks = [{"kind": "line", "bbox": ln["bbox"], "line": ln} for ln in lines]
                 blocks += [{"kind": "table", "bbox": t.bbox, "table": t} for t in tables]
@@ -329,6 +435,7 @@ def build_hwpx(pdf_path: str, output_path: str, *, dpi: int = 150, max_pages: in
                             width=pt_to_hwpunit(ix1 - ix0),
                             height=pt_to_hwpunit(iy1 - iy0),
                             treat_as_char=False,
+                            text_wrap="BEHIND_TEXT" if image.get("behind_text") else None,
                             pos_overrides={
                                 "horzRelTo": "PAPER",
                                 "vertRelTo": "PAPER",
@@ -373,8 +480,11 @@ if __name__ == "__main__":
 # - PDF에 쓰인 원본 폰트는 그대로 옮겨지지 않고, 한/글 기본 폰트로 대체됩니다. 글자
 #   폭이 달라지므로 줄바꿈 위치가 PDF와 미세하게 어긋날 수 있습니다.
 # - 다단(multi-column) 레이아웃은 열을 인식하지 못하고 위→아래 순서로만 배치됩니다.
-# - 회전된 텍스트, 벡터 도형(선/사각형 등)은 변환되지 않습니다. 이미지는 해당 영역을
-#   비트맵으로 다시 렌더링해 원래 위치에 삽입합니다.
+# - 회전된 텍스트는 변환되지 않습니다. 사진(래스터 이미지)은 해당 영역을 비트맵으로
+#   다시 렌더링해 원래 위치에 삽입합니다. 장식용 벡터 도형(색띠, 배경 박스, 그라데이션
+#   등)도 인접한 도형끼리 묶어 하나의 영역으로 비트맵 렌더링해 배치하지만, 그 영역에
+#   텍스트가 겹쳐 있으면 텍스트 중복을 막기 위해 아예 건너뜁니다(그 부분은 배경색이
+#   빠집니다). 페이지 전체를 덮는 큰 배경/장식은 다른 내용을 가리지 않도록 제외됩니다.
 # - 표는 PyMuPDF의 표 감지 기능으로 찾아 실제 HWPX 표(<hp:tbl>)로 재구성합니다. 다만:
 #     * 셀 병합(merge)은 자동으로 복원하지 않습니다 — 병합되어 있던 셀도 각각 별도
 #       셀로 채워집니다.
