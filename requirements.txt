@@ -1,0 +1,2 @@
+pymupdf==1.28.0
+python-hwpx==4.2.0
